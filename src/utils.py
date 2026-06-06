@@ -1,23 +1,14 @@
 import json
 import logging
 import os
-import platform
-import re
-import shutil
-import sys
-import tempfile
-import urllib.parse
 
-from selenium.webdriver.chrome.webdriver import WebDriver
-import undetected_chromedriver as uc
+from camoufox.async_api import AsyncCamoufox
+
+import browser_loop
 
 FLARESOLVERR_VERSION = None
 PLATFORM_VERSION = None
-CHROME_EXE_PATH = None
-CHROME_MAJOR_VERSION = None
 USER_AGENT = None
-XVFB_DISPLAY = None
-PATCHED_DRIVER_PATH = None
 
 
 def get_config_log_html() -> bool:
@@ -32,6 +23,11 @@ def get_config_disable_media() -> bool:
     return os.environ.get('DISABLE_MEDIA', 'false').lower() == 'true'
 
 
+def get_config_humanize() -> bool:
+    # human-like cursor movement helps pass Cloudflare; set HUMANIZE=false to disable
+    return os.environ.get('HUMANIZE', 'true').lower() == 'true'
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:
@@ -44,6 +40,7 @@ def get_flaresolverr_version() -> str:
         FLARESOLVERR_VERSION = json.loads(f.read())['version']
         return FLARESOLVERR_VERSION
 
+
 def get_current_platform() -> str:
     global PLATFORM_VERSION
     if PLATFORM_VERSION is not None:
@@ -52,295 +49,77 @@ def get_current_platform() -> str:
     return PLATFORM_VERSION
 
 
-def create_proxy_extension(proxy: dict) -> str:
-    parsed_url = urllib.parse.urlparse(proxy['url'])
-    scheme = parsed_url.scheme
-    host = parsed_url.hostname
-    port = parsed_url.port
-    username = proxy['username']
-    password = proxy['password']
-    manifest_json = """
-    {
-        "version": "1.0.0",
-        "manifest_version": 3,
-        "name": "Chrome Proxy",
-        "permissions": [
-            "proxy",
-            "tabs",
-            "storage",
-            "webRequest",
-            "webRequestAuthProvider"
-        ],
-        "host_permissions": [
-          "<all_urls>"
-        ],
-        "background": {
-          "service_worker": "background.js"
-        },
-        "minimum_chrome_version": "76.0.0"
-    }
+def _camoufox_proxy(proxy: dict):
+    """Map a FlareSolverr proxy dict to a Playwright/camoufox proxy dict.
+
+    FlareSolverr uses ``{'url', 'username', 'password'}``; camoufox (Playwright)
+    expects ``{'server', 'username', 'password'}``. Authenticated proxies are
+    handled natively, so the old Chrome proxy-auth extension is no longer needed.
     """
-
-    background_js = """
-    var config = {
-        mode: "fixed_servers",
-        rules: {
-            singleProxy: {
-                scheme: "%s",
-                host: "%s",
-                port: %d
-            },
-            bypassList: ["localhost"]
-        }
-    };
-
-    chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-
-    function callbackFn(details) {
-        return {
-            authCredentials: {
-                username: "%s",
-                password: "%s"
-            }
-        };
-    }
-
-    chrome.webRequest.onAuthRequired.addListener(
-        callbackFn,
-        { urls: ["<all_urls>"] },
-        ['blocking']
-    );
-    """ % (
-        scheme,
-        host,
-        port,
-        username,
-        password
-    )
-
-    proxy_extension_dir = tempfile.mkdtemp()
-
-    with open(os.path.join(proxy_extension_dir, "manifest.json"), "w") as f:
-        f.write(manifest_json)
-
-    with open(os.path.join(proxy_extension_dir, "background.js"), "w") as f:
-        f.write(background_js)
-
-    return proxy_extension_dir
+    if not proxy or 'url' not in proxy:
+        return None
+    pw_proxy = {'server': proxy['url']}
+    if proxy.get('username'):
+        pw_proxy['username'] = proxy['username']
+    if proxy.get('password'):
+        pw_proxy['password'] = proxy['password']
+    return pw_proxy
 
 
-def get_webdriver(proxy: dict = None) -> WebDriver:
-    global PATCHED_DRIVER_PATH, USER_AGENT
-    logging.debug('Launching web browser...')
+async def launch_camoufox(proxy: dict = None):
+    """Start a camoufox (Firefox) browser on the background loop.
 
-    # undetected_chromedriver
-    options = uc.ChromeOptions()
-    options.add_argument('--no-sandbox')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--disable-search-engine-choice-screen')
-    # todo: this param shows a warning in chrome head-full
-    options.add_argument('--disable-setuid-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
-    options.add_argument('--no-zygote')
-    # attempt to fix Docker ARM32 build
-    IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
-    if IS_ARMARCH:
-        options.add_argument('--disable-gpu-sandbox')
-    options.add_argument('--ignore-certificate-errors')
-    options.add_argument('--ignore-ssl-errors')
-    # disable breaking popup
-    options.add_argument("--disable-features=LocalNetworkAccessChecks")
+    Returns ``(camoufox_instance, browser)`` where ``browser`` is a Playwright
+    ``Browser``. The camoufox instance is kept so it can be stopped later via
+    :func:`stop_camoufox`. ``humanize`` enables human-like cursor movement which
+    materially improves Cloudflare pass rates.
+    """
+    logging.debug('Launching camoufox browser...')
+    kwargs = {'headless': get_config_headless(), 'humanize': get_config_humanize()}
+    pw_proxy = _camoufox_proxy(proxy)
+    if pw_proxy:
+        kwargs['proxy'] = pw_proxy
+    cf = AsyncCamoufox(**kwargs)
+    browser = await cf.start()
+    return cf, browser
 
-    language = os.environ.get('LANG', None)
-    if language is not None:
-        options.add_argument('--accept-lang=%s' % language)
 
-    # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
-    if USER_AGENT is not None:
-        options.add_argument('--user-agent=%s' % USER_AGENT)
-
-    proxy_extension_dir = None
-    if proxy and all(key in proxy for key in ['url', 'username', 'password']):
-        proxy_extension_dir = create_proxy_extension(proxy)
-        options.add_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
-        options.add_argument("--load-extension=%s" % os.path.abspath(proxy_extension_dir))
-    elif proxy and 'url' in proxy:
-        proxy_url = proxy['url']
-        logging.debug("Using webdriver proxy: %s", proxy_url)
-        options.add_argument('--proxy-server=%s' % proxy_url)
-
-    # note: headless mode is detected (headless = True)
-    # we launch the browser in head-full mode with the window hidden
-    windows_headless = False
-    if get_config_headless():
-        if os.name == 'nt':
-            windows_headless = True
-        else:
-            start_xvfb_display()
-    # For normal headless mode:
-    # options.add_argument('--headless')
-
-    # if we are inside the Docker container, we avoid downloading the driver
-    driver_exe_path = None
-    version_main = None
-    if os.path.exists("/app/chromedriver"):
-        # running inside Docker
-        driver_exe_path = "/app/chromedriver"
-    else:
-        version_main = get_chrome_major_version()
-        if PATCHED_DRIVER_PATH is not None:
-            driver_exe_path = PATCHED_DRIVER_PATH
-
-    # detect chrome path
-    browser_executable_path = get_chrome_exe_path()
-
-    # downloads and patches the chromedriver
-    # if we don't set driver_executable_path it downloads, patches, and deletes the driver each time
+async def stop_camoufox(cf, browser=None):
+    """Stop a camoufox instance started with :func:`launch_camoufox`."""
     try:
-        driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path,
-                           driver_executable_path=driver_exe_path, version_main=version_main,
-                           windows_headless=windows_headless, headless=get_config_headless())
+        # AsyncCamoufox is an async context manager; start() == __aenter__
+        await cf.__aexit__(None, None, None)
     except Exception as e:
-        logging.error("Error starting Chrome: %s" % e)
-        # No point in continuing if we cannot retrieve the driver
-        raise e
-
-    # save the patched driver to avoid re-downloads
-    if driver_exe_path is None:
-        PATCHED_DRIVER_PATH = os.path.join(driver.patcher.data_path, driver.patcher.exe_name)
-        if PATCHED_DRIVER_PATH != driver.patcher.executable_path:
-            shutil.copy(driver.patcher.executable_path, PATCHED_DRIVER_PATH)
-
-    # clean up proxy extension directory
-    if proxy_extension_dir is not None:
-        shutil.rmtree(proxy_extension_dir)
-
-    # selenium vanilla
-    # options = webdriver.ChromeOptions()
-    # options.add_argument('--no-sandbox')
-    # options.add_argument('--window-size=1920,1080')
-    # options.add_argument('--disable-setuid-sandbox')
-    # options.add_argument('--disable-dev-shm-usage')
-    # driver = webdriver.Chrome(options=options)
-
-    return driver
-
-
-def get_chrome_exe_path() -> str:
-    global CHROME_EXE_PATH
-    if CHROME_EXE_PATH is not None:
-        return CHROME_EXE_PATH
-    # linux pyinstaller bundle
-    chrome_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chrome', "chrome")
-    if os.path.exists(chrome_path):
-        if not os.access(chrome_path, os.X_OK):
-            raise Exception(f'Chrome binary "{chrome_path}" is not executable. '
-                            f'Please, extract the archive with "tar xzf <file.tar.gz>".')
-        CHROME_EXE_PATH = chrome_path
-        return CHROME_EXE_PATH
-    # windows pyinstaller bundle
-    chrome_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chrome', "chrome.exe")
-    if os.path.exists(chrome_path):
-        CHROME_EXE_PATH = chrome_path
-        return CHROME_EXE_PATH
-    # system
-    CHROME_EXE_PATH = uc.find_chrome_executable()
-    return CHROME_EXE_PATH
-
-
-def get_chrome_major_version() -> str:
-    global CHROME_MAJOR_VERSION
-    if CHROME_MAJOR_VERSION is not None:
-        return CHROME_MAJOR_VERSION
-
-    if os.name == 'nt':
-        # Example: '104.0.5112.79'
-        try:
-            complete_version = extract_version_nt_executable(get_chrome_exe_path())
-        except Exception:
+        logging.debug("Error stopping camoufox (%s); closing browser directly", e)
+        if browser is not None:
             try:
-                complete_version = extract_version_nt_registry()
+                await browser.close()
             except Exception:
-                # Example: '104.0.5112.79'
-                complete_version = extract_version_nt_folder()
-    else:
-        chrome_path = get_chrome_exe_path()
-        process = os.popen(f'"{chrome_path}" --version')
-        # Example 1: 'Chromium 104.0.5112.79 Arch Linux\n'
-        # Example 2: 'Google Chrome 104.0.5112.79 Arch Linux\n'
-        complete_version = process.read()
-        process.close()
-
-    CHROME_MAJOR_VERSION = complete_version.split('.')[0].split(' ')[-1]
-    return CHROME_MAJOR_VERSION
+                pass
 
 
-def extract_version_nt_executable(exe_path: str) -> str:
-    import pefile
-    pe = pefile.PE(exe_path, fast_load=True)
-    pe.parse_data_directories(
-        directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
-    )
-    return pe.FileInfo[0][0].StringTable[0].entries[b"FileVersion"].decode('utf-8')
-
-
-def extract_version_nt_registry() -> str:
-    stream = os.popen(
-        'reg query "HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Google Chrome"')
-    output = stream.read()
-    google_version = ''
-    for letter in output[output.rindex('DisplayVersion    REG_SZ') + 24:]:
-        if letter != '\n':
-            google_version += letter
-        else:
-            break
-    return google_version.strip()
-
-
-def extract_version_nt_folder() -> str:
-    # Check if the Chrome folder exists in the x32 or x64 Program Files folders.
-    for i in range(2):
-        path = 'C:\\Program Files' + (' (x86)' if i else '') + '\\Google\\Chrome\\Application'
-        if os.path.isdir(path):
-            paths = [f.path for f in os.scandir(path) if f.is_dir()]
-            for path in paths:
-                filename = os.path.basename(path)
-                pattern = r'\d+\.\d+\.\d+\.\d+'
-                match = re.search(pattern, filename)
-                if match and match.group():
-                    # Found a Chrome version.
-                    return match.group(0)
-    return ''
-
-
-def get_user_agent(driver=None) -> str:
+def get_user_agent() -> str:
+    """Return the browser User-Agent, launching a one-off camoufox if needed."""
     global USER_AGENT
     if USER_AGENT is not None:
         return USER_AGENT
 
+    async def _probe():
+        cf, browser = await launch_camoufox()
+        try:
+            context = await browser.new_context()
+            page = await context.new_page()
+            ua = await page.evaluate("() => navigator.userAgent")
+            await context.close()
+            return ua
+        finally:
+            await stop_camoufox(cf, browser)
+
     try:
-        if driver is None:
-            driver = get_webdriver()
-        USER_AGENT = driver.execute_script("return navigator.userAgent")
-        # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
-        USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
+        USER_AGENT = browser_loop.run_coro(_probe())
         return USER_AGENT
     except Exception as e:
         raise Exception("Error getting browser User-Agent. " + str(e))
-    finally:
-        if driver is not None:
-            if PLATFORM_VERSION == "nt":
-                driver.close()
-            driver.quit()
-
-
-def start_xvfb_display():
-    global XVFB_DISPLAY
-    if XVFB_DISPLAY is None:
-        from xvfbwrapper import Xvfb
-        XVFB_DISPLAY = Xvfb()
-        XVFB_DISPLAY.start()
 
 
 def object_to_dict(_object):

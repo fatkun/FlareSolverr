@@ -4,19 +4,34 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from uuid import uuid1
 
-from selenium.webdriver.chrome.webdriver import WebDriver
-
+import browser_loop
 import utils
 
 
 @dataclass
 class Session:
     session_id: str
-    driver: WebDriver
+    cf_instance: object  # camoufox AsyncCamoufox handle (for teardown)
+    browser: object      # playwright Browser
+    context: object      # long-lived playwright BrowserContext (keeps cookies across requests)
     created_at: datetime
 
     def lifetime(self) -> timedelta:
         return datetime.now() - self.created_at
+
+
+async def _create_session_objects(proxy: Optional[dict]):
+    cf, browser = await utils.launch_camoufox(proxy)
+    context = await browser.new_context()
+    return cf, browser, context
+
+
+async def _close_session_objects(session: Session):
+    try:
+        await session.context.close()
+    except Exception:
+        pass
+    await utils.stop_camoufox(session.cf_instance, session.browser)
 
 
 class SessionsStorage:
@@ -27,15 +42,12 @@ class SessionsStorage:
 
     def create(self, session_id: Optional[str] = None, proxy: Optional[dict] = None,
                force_new: Optional[bool] = False) -> Tuple[Session, bool]:
-        """create creates new instance of WebDriver if necessary,
-        assign defined (or newly generated) session_id to the instance
-        and returns the session object. If a new session has been created
-        second argument is set to True.
+        """create creates a new camoufox browser if necessary, assigns the
+        defined (or newly generated) session_id to it and returns the session
+        object. If a new session has been created the second argument is True.
 
-        Note: The function is idempotent, so in case if session_id
-        already exists in the storage a new instance of WebDriver won't be created
-        and existing session will be returned. Second argument defines if 
-        new session has been created (True) or an existing one was used (False).
+        Note: The function is idempotent, so if session_id already exists a new
+        browser won't be created and the existing session will be returned.
         """
         session_id = session_id or str(uuid1())
 
@@ -45,9 +57,9 @@ class SessionsStorage:
         if self.exists(session_id):
             return self.sessions[session_id], False
 
-        driver = utils.get_webdriver(proxy)
+        cf, browser, context = browser_loop.run_coro(_create_session_objects(proxy))
         created_at = datetime.now()
-        session = Session(session_id, driver, created_at)
+        session = Session(session_id, cf, browser, context, created_at)
 
         self.sessions[session_id] = session
 
@@ -57,18 +69,18 @@ class SessionsStorage:
         return session_id in self.sessions
 
     def destroy(self, session_id: str) -> bool:
-        """destroy closes the driver instance and removes session from the storage.
-        The function is noop if session_id doesn't exist.
-        The function returns True if session was found and destroyed,
-        and False if session_id wasn't found.
+        """destroy closes the browser instance and removes the session from the
+        storage. The function is noop if session_id doesn't exist. Returns True
+        if the session was found and destroyed, False otherwise.
         """
         if not self.exists(session_id):
             return False
 
         session = self.sessions.pop(session_id)
-        if utils.PLATFORM_VERSION == "nt":
-            session.driver.close()
-        session.driver.quit()
+        try:
+            browser_loop.run_coro(_close_session_objects(session))
+        except Exception as e:
+            logging.debug(f"Error closing session (session_id={session_id}): {e}")
         return True
 
     def get(self, session_id: str, ttl: Optional[timedelta] = None) -> Tuple[Session, bool]:
