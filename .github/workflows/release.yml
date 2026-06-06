@@ -28,7 +28,7 @@ jobs:
         with:
           body: ${{ steps.github_changelog.outputs.changelog }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-package:
     name: Build binaries
@@ -60,4 +60,4 @@ jobs:
         with:
           files: ./dist/flaresolverr_*
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
