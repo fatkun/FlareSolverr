@@ -9,6 +9,11 @@ on:
       - master
   workflow_dispatch:
     inputs:
+      build_amd64:
+        description: 'Build AMD64 image'
+        required: true
+        default: true
+        type: boolean
       build_arm64:
         description: 'Build ARM64 image (slow, ~45min with QEMU)'
         required: true
@@ -21,7 +26,7 @@ concurrency:
 
 jobs:
   build-amd64:
-    if: ${{ !github.event.pull_request.head.repo.fork }}
+    if: ${{ !github.event.pull_request.head.repo.fork && (github.event_name != 'workflow_dispatch' || inputs.build_amd64) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
