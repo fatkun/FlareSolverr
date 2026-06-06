@@ -1,6 +1,19 @@
+# Multi-stage build to reduce final image size
+FROM docker.io/library/python:3.11-slim-bookworm AS builder
+
+WORKDIR /app
+
+# Install Python dependencies in builder stage
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target=/app/deps -r requirements.txt
+
+# Final stage
 FROM docker.io/library/python:3.11-slim-bookworm
 
 WORKDIR /app
+
+# Copy Python dependencies from builder
+COPY --from=builder /app/deps /usr/local/lib/python3.11/site-packages/
 
 # Install system dependencies and create the flaresolverr user.
 # camoufox ships its own Firefox build (fetched below), so we no longer install
@@ -19,13 +32,16 @@ RUN apt-get update \
 
 VOLUME /config
 
-# Install Python dependencies (camoufox pulls in playwright), then install
-# Firefox's system library dependencies via Playwright.
-COPY requirements.txt .
-RUN pip install -r requirements.txt \
-    && python -m playwright install-deps firefox \
-    # Remove temporary files
-    && rm -rf /var/lib/apt/lists/* /root/.cache
+# Install Firefox's system library dependencies via Playwright.
+RUN python -m playwright install-deps firefox \
+    # Remove temporary files and optimize size
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* \
+    # Remove hardware decoding libraries (from old Dockerfile optimization)
+    && rm -f /usr/lib/x86_64-linux-gnu/libmfxhw* \
+    && rm -f /usr/lib/x86_64-linux-gnu/mfx/* \
+    # Remove unnecessary fonts and icons to save space
+    && rm -rf /usr/share/icons/Adwaita \
+    && rm -rf /usr/share/fonts/truetype/noto
 
 USER flaresolverr
 
@@ -42,7 +58,9 @@ EXPOSE 8192
 # dumb-init avoids zombie browser processes
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 
-CMD ["/usr/local/bin/python", "-u", "/app/flaresolverr.py"]
+# When HEADLESS=false, run with xvfb-run to provide a virtual display
+# xvfb-run creates display :99, dimensions 1920x1080x24
+CMD ["sh", "-c", "if [ \"$HEADLESS\" = 'false' ]; then xvfb-run -s '-screen 0 1920x1080x24' /usr/local/bin/python -u /app/flaresolverr.py; else /usr/local/bin/python -u /app/flaresolverr.py; fi"]
 
 # Local build
 # docker build -t ngosang/flaresolverr:3.5.0 .
